@@ -62,6 +62,58 @@ class SeverityAssessment:
         'BadRequestException': 4,
     }
     
+    # HTTP 상태 코드별 위험 가중치
+    HTTP_STATUS_WEIGHTS = {
+        # 5xx 서버 오류 (Critical/High: 9-10)
+        '500': 10,  # Internal Server Error - 서버 내부 오류
+        '503': 10,  # Service Unavailable - 서비스 불가
+        '504': 9,   # Gateway Timeout - 게이트웨이 타임아웃
+        '502': 9,   # Bad Gateway - 게이트웨이 오류
+        '501': 8,   # Not Implemented - 미구현
+        '505': 8,   # HTTP Version Not Supported
+        
+        # 4xx 클라이언트 오류 (Medium/Low: 4-7)
+        '401': 7,   # Unauthorized - 인증 실패 (보안 이슈)
+        '403': 7,   # Forbidden - 접근 금지 (보안 이슈)
+        '429': 6,   # Too Many Requests - 과도한 요청
+        '408': 6,   # Request Timeout - 요청 타임아웃
+        '400': 5,   # Bad Request - 잘못된 요청
+        '404': 4,   # Not Found - 리소스 없음 (일반적)
+        '405': 4,   # Method Not Allowed - 메서드 불가
+        '406': 4,   # Not Acceptable - 허용 불가
+        '409': 5,   # Conflict - 충돌
+        '410': 4,   # Gone - 영구적으로 없음
+        '411': 4,   # Length Required
+        '412': 5,   # Precondition Failed
+        '413': 5,   # Payload Too Large
+        '414': 4,   # URI Too Long
+        '415': 4,   # Unsupported Media Type
+        '416': 4,   # Range Not Satisfiable
+        '417': 4,   # Expectation Failed
+        '422': 5,   # Unprocessable Entity
+        '423': 5,   # Locked
+        '424': 5,   # Failed Dependency
+        '426': 4,   # Upgrade Required
+        '428': 5,   # Precondition Required
+        '431': 5,   # Request Header Fields Too Large
+        '451': 6,   # Unavailable For Legal Reasons
+        
+        # 3xx 리다이렉션 (Low: 1-2)
+        '301': 1,   # Moved Permanently
+        '302': 1,   # Found
+        '303': 1,   # See Other
+        '304': 0,   # Not Modified (정상)
+        '307': 1,   # Temporary Redirect
+        '308': 1,   # Permanent Redirect
+        
+        # 2xx 성공 (Info: 0)
+        '200': 0,   # OK - 정상
+        '201': 0,   # Created - 생성됨
+        '202': 0,   # Accepted - 수락됨
+        '204': 0,   # No Content - 내용 없음
+        '206': 0,   # Partial Content - 부분 내용
+    }
+    
     # 예외 유형 패턴 (정규식)
     EXCEPTION_PATTERNS = {
         'jvm_critical': re.compile(
@@ -90,9 +142,48 @@ class SeverityAssessment:
         ),
     }
     
+    # HTTP 상태 코드 패턴 (정규식)
+    HTTP_STATUS_PATTERN = re.compile(
+        r'\b(?:HTTP/[\d.]+)?\s*(\d{3})\b|'  # HTTP/1.1 404 또는 단독 404
+        r'status[:\s]+(\d{3})|'              # status: 404 또는 status 404
+        r'code[:\s]+(\d{3})|'                # code: 404 또는 code 404
+        r'response[:\s]+(\d{3})|'            # response: 404
+        r'returned[:\s]+(\d{3})',            # returned: 404
+        re.IGNORECASE
+    )
+    
     def __init__(self):
         """초기화"""
         pass
+    
+    def extract_http_status_code(self, message: str) -> Optional[Tuple[str, int]]:
+        """
+        메시지에서 HTTP 상태 코드 추출 및 가중치 반환
+        
+        Args:
+            message: 로그 메시지
+        
+        Returns:
+            (HTTP 상태 코드, 가중치) 튜플 또는 None
+        """
+        if not message:
+            return None
+        
+        match = self.HTTP_STATUS_PATTERN.search(message)
+        if match:
+            # 여러 그룹 중 첫 번째 매칭된 상태 코드 사용
+            status_code = None
+            for group in match.groups():
+                if group:
+                    status_code = group
+                    break
+            
+            if status_code:
+                weight = self.HTTP_STATUS_WEIGHTS.get(status_code, 0)
+                if weight > 0:
+                    return (f'HTTP_{status_code}', weight)
+        
+        return None
     
     def extract_exception_type(self, message: str) -> Optional[Tuple[str, int]]:
         """
@@ -137,7 +228,15 @@ class SeverityAssessment:
         # 레벨 가중치
         level_weight = self.LEVEL_WEIGHTS.get(level.upper(), 0)
         
-        # 예외 유형 가중치
+        # HTTP 상태 코드 가중치 (우선순위 1)
+        http_status_info = self.extract_http_status_code(message)
+        if http_status_info:
+            http_status_type, http_status_weight = http_status_info
+        else:
+            http_status_type = None
+            http_status_weight = 0
+        
+        # 예외 유형 가중치 (우선순위 2)
         exception_info = self.extract_exception_type(message)
         if exception_info:
             exception_type, exception_weight = exception_info
@@ -145,8 +244,8 @@ class SeverityAssessment:
             exception_type = None
             exception_weight = 0
         
-        # 최종 심각도 점수 (레벨과 예외 중 높은 값 사용)
-        severity_score = max(level_weight, exception_weight)
+        # 최종 심각도 점수 (레벨, HTTP 상태 코드, 예외 중 가장 높은 값 사용)
+        severity_score = max(level_weight, http_status_weight, exception_weight)
         
         # 심각도 등급
         if severity_score >= 9:
@@ -170,6 +269,8 @@ class SeverityAssessment:
             'severity_level': severity_level,
             'severity_description': severity_description,
             'level_weight': level_weight,
+            'http_status_code': http_status_type,
+            'http_status_weight': http_status_weight,
             'exception_type': exception_type,
             'exception_weight': exception_weight,
         }

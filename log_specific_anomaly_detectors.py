@@ -281,7 +281,8 @@ class DeepLogDetector:
     def train(self, logs_df: pd.DataFrame, epochs=50, batch_size=32, learning_rate=0.001, log_dir=None):
         """모델 학습"""
         # 로거 설정
-        log_dir_path = log_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs', 'training')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir_path = log_dir or os.path.join(current_dir, 'logs', 'training')
         logger = setup_training_logger('deeplog', log_dir_path)
         
         logger.info("=" * 60)
@@ -538,7 +539,8 @@ class LogAnomalyDetector:
             batch_size: 무시됨 (통계 기반 모델이므로 불필요)
         """
         # 로거 설정
-        log_dir_path = log_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs', 'training')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir_path = log_dir or os.path.join(current_dir, 'logs', 'training')
         logger = setup_training_logger('loganomaly', log_dir_path)
         
         logger.info("=" * 60)
@@ -716,7 +718,8 @@ class LogRobustDetector:
     def train(self, logs_df: pd.DataFrame, sequence_length=10, epochs=50, batch_size=32, log_dir=None):
         """모델 학습"""
         # 로거 설정
-        log_dir_path = log_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs', 'training')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir_path = log_dir or os.path.join(current_dir, 'logs', 'training')
         logger = setup_training_logger('logrobust', log_dir_path)
         
         logger.info("=" * 60)
@@ -1064,7 +1067,20 @@ def analyze_risk_level(anomalies_df: pd.DataFrame, test_logs_df: pd.DataFrame = 
         'creating a new sqlsession', 'closing non transactional',
         'jdbc connection', 'hikariproxyconnection', 'will not be managed',
         'registered for synchronization', 'accept-language',
-        'heartbeat status: 200', 'discoveryclient'
+        'heartbeat status: 200', 'discoveryclient',
+        # 추가 패턴
+        'channel=', 'asynccommand', 'write()', 'completing command',
+        'dispatching command', 'decode done', 'stack contains',
+        'converted value on extraction', 'doFilterInternal',
+        'completed cache refresh', 'got delta update', 'config resolved',
+        'pinning to endpoint', 'total number of instances',
+        'running with spring boot', 'adding type registration'
+    ]
+    
+    # 예외 키워드 제외 패턴 (오탐지 방지)
+    EXCEPTION_FALSE_POSITIVES = [
+        "error='null'", "error=null", "error: 'null'", "error: null",
+        "output=null", "output='null'", "output: null", "output: 'null'"
     ]
     
     # 위험도 점수 계산 함수 (개선된 로직)
@@ -1072,32 +1088,51 @@ def analyze_risk_level(anomalies_df: pd.DataFrame, test_logs_df: pd.DataFrame = 
         anomaly_score = row['anomaly_score']
         severity_score = row['max_severity_score']
         
-        # 로그 메시지 확인 (가능한 경우)
+        # 로그 메시지 확인 (우선순위: sample_messages > test_logs_df)
         messages = ""
-        if test_logs_df is not None and 'sequence_index' in row:
+        
+        # 1순위: sample_messages 컬럼이 있으면 사용
+        if 'sample_messages' in row and pd.notna(row['sample_messages']):
+            messages = str(row['sample_messages']).lower()
+        # 2순위: test_logs_df에서 메시지 추출
+        elif test_logs_df is not None and 'sequence_index' in row:
             try:
                 seq_idx = int(row['sequence_index'])
                 seq_len = 15  # 시퀀스 길이
                 start_idx = max(0, seq_idx)
                 end_idx = min(len(test_logs_df), seq_idx + seq_len)
-                sequence_logs = test_logs_df.iloc[start_idx:end_idx]
-                messages = ' '.join(sequence_logs['message'].astype(str).tolist()).lower()
-            except:
+                
+                # 인덱스 범위 확인
+                if start_idx < len(test_logs_df) and end_idx > start_idx:
+                    sequence_logs = test_logs_df.iloc[start_idx:end_idx]
+                    if 'message' in sequence_logs.columns:
+                        message_list = sequence_logs['message'].astype(str).tolist()
+                        messages = ' '.join(message_list).lower()
+            except (ValueError, IndexError, KeyError, AttributeError) as e:
+                # 예외 발생 시 빈 문자열 유지 (디버깅용으로 주석 처리)
+                # print(f"Warning: 메시지 추출 실패 (seq_idx={row.get('sequence_index', 'N/A')}): {e}")
                 pass
-        
-        # sample_messages 컬럼이 있으면 사용
-        if 'sample_messages' in row and pd.notna(row['sample_messages']):
-            messages = str(row['sample_messages']).lower()
         
         # 정상 쿼리 패턴 확인
         is_normal_query = False
         if messages:
             is_normal_query = any(pattern in messages for pattern in NORMAL_QUERY_PATTERNS)
         
-        # 실제 위험 키워드 확인
+        # 실제 위험 키워드 확인 (오탐지 제외)
         has_real_exception = False
         if messages:
-            has_real_exception = any(keyword in messages for keyword in CRITICAL_KEYWORDS)
+            # 먼저 오탐지 패턴 제외
+            is_false_positive = any(fp_pattern in messages for fp_pattern in EXCEPTION_FALSE_POSITIVES)
+            if not is_false_positive:
+                # 실제 예외 키워드 확인 (단어 경계 고려)
+                for keyword in CRITICAL_KEYWORDS:
+                    # 단순 포함이 아닌 단어 경계 확인 (더 정확한 매칭)
+                    if keyword in messages:
+                        # "error='null'" 같은 패턴 제외
+                        if keyword == 'error' and ("error='null'" in messages or "error=null" in messages or "error: 'null'" in messages):
+                            continue
+                        has_real_exception = True
+                        break
         
         # 위험도 계산 (상황별 가중치 조정)
         if is_normal_query and not has_real_exception:
@@ -1116,11 +1151,13 @@ def analyze_risk_level(anomalies_df: pd.DataFrame, test_logs_df: pd.DataFrame = 
                 (severity_score / 10) * 70  # 심각도 점수 가중치 높임
             )
         else:
-            # 기본 계산 (기존과 유사하지만 약간 조정)
+            # 기본 계산 (가중치 낮춤 - 정상 쿼리가 아닌 경우에도 CRITICAL 방지)
             risk_score = (
-                anomaly_score * 40 +  # 이상 점수 40% 가중치
-                (severity_score / 10) * 40  # 심각도 점수 40% 가중치
+                anomaly_score * 25 +  # 이상 점수 가중치 낮춤 (40 → 25)
+                (severity_score / 10) * 30  # 심각도 점수 가중치 낮춤 (40 → 30)
             )
+            # 기본 계산도 최대 79점으로 제한 (CRITICAL 방지)
+            risk_score = min(79, risk_score)
         
         # 점수 범위 제한 (0-150, 하지만 100 이상은 매우 드뭄)
         return min(150, max(0, risk_score))
@@ -1271,7 +1308,9 @@ def main():
     """메인 실행 함수 - LogAnomaly 모델을 사용한 이상 탐지 및 위험도 분석"""
     from log_anomaly_detector import SpringBootLogParser
     
-    log_directory = "/Users/zzangdol/PycharmProjects/zzangdol/pattern/prelog/logs/backup"
+    # 현재 파일의 디렉토리를 기준으로 상대 경로 설정
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    log_directory = os.path.join(current_dir, "logs", "backup")
     
     print("=" * 70)
     print("LogAnomaly 기반 이상 탐지 및 위험도 분석 시스템")
@@ -1371,16 +1410,45 @@ def main():
     anomalies_df = results['anomalies']
     print(f"✅ {len(anomalies_df):,}개 이상 시퀀스 탐지")
     
-    # 5. 위험도 분석 (개선된 로직 적용)
-    print("\n5단계: 위험도 분석 (개선된 로직: 정상 쿼리 필터링, 실제 예외 감지)")
+    # 5. 위험도 분석 전에 메시지 정보 추가 (위험도 계산에 필요)
+    print("\n5단계: 위험도 분석 준비 (로그 메시지 추출)")
+    if not anomalies_df.empty and 'sequence_index' in anomalies_df.columns:
+        # 각 이상 시퀀스의 로그 메시지 추출
+        sample_messages_list = []
+        for idx, row in anomalies_df.iterrows():
+            try:
+                seq_idx = int(row['sequence_index'])
+                seq_len = 15  # 시퀀스 길이
+                start_idx = max(0, seq_idx)
+                end_idx = min(len(test_logs), seq_idx + seq_len)
+                
+                if start_idx < len(test_logs) and end_idx > start_idx:
+                    sequence_logs = test_logs.iloc[start_idx:end_idx]
+                    if 'message' in sequence_logs.columns:
+                        message_list = sequence_logs['message'].astype(str).tolist()
+                        sample_messages_list.append(' | '.join(message_list[:3]))  # 처음 3개만
+                    else:
+                        sample_messages_list.append('')
+                else:
+                    sample_messages_list.append('')
+            except (ValueError, IndexError, KeyError, AttributeError):
+                sample_messages_list.append('')
+        
+        anomalies_df['sample_messages'] = sample_messages_list
+        print(f"   ✅ {len([m for m in sample_messages_list if m])}개 시퀀스의 메시지 추출 완료")
+    
+    # 6. 위험도 분석 (개선된 로직 적용)
+    print("\n6단계: 위험도 분석 (개선된 로직: 정상 쿼리 필터링, 실제 예외 감지)")
     anomalies_with_risk = analyze_risk_level(anomalies_df, test_logs)
     risk_report = generate_risk_report(anomalies_with_risk, test_logs)
     
-    # 6. 위험도 리포트 출력
+    # 7. 위험도 리포트 출력
     print_risk_report(risk_report)
     
-    # 7. 결과 저장 (동적 폴더 생성)
-    base_dir = "/Users/zzangdol/PycharmProjects/zzangdol/pattern/prelog/results"
+    # 8. 결과 저장 (동적 폴더 생성)
+    # 현재 파일의 디렉토리를 기준으로 상대 경로 설정
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.join(current_dir, "results")
     base_folder_name = "loganomaly_risk_analysis"
     
     # 폴더가 이미 존재하면 번호를 증가시켜 새 폴더 생성
