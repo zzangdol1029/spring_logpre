@@ -4,3 +4,8 @@ chunks/
 # Logs backup 폴더
 logs/backup/
 
+# 큰 parquet 파일들 (GitHub 100MB 제한)
+*.parquet
+split_data/
+parsed_data.parquet
+
